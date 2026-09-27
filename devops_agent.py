@@ -1,0 +1,366 @@
+"""
+DevOps / CI Agent.
+Generates a complete CI/CD pipeline scaffold for the generated project:
+  - GitHub Actions workflow (lint + type-check + pytest on push/PR)
+  - requirements.txt / pyproject.toml
+  - .pre-commit-config.yaml (optional)
+  - Dockerfile (optional)
+Composable: toggled via feature_flags["cicd_scaffolding"].
+"""
+
+import json
+import re
+from dataclasses import dataclass, asdict, field
+from typing import Any, Dict, List, Optional
+from llm_provider import BaseLLMProvider
+from .requirements_agent import RequirementsDocument
+from .architecture_agent import ArchitectureDocument
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data models
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class CICDPackage:
+    github_actions_workflow: str   # content of .github/workflows/ci.yml
+    requirements_txt: str
+    pre_commit_config: str
+    dockerfile: str
+    readme_ci_section: str         # markdown snippet to append to README
+    files: Dict[str, str] = field(default_factory=dict)  # all files keyed by path
+    reasoning: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CICDPackage":
+        return cls(
+            github_actions_workflow=data.get("github_actions_workflow", ""),
+            requirements_txt=data.get("requirements_txt", "pytest\n"),
+            pre_commit_config=data.get("pre_commit_config", ""),
+            dockerfile=data.get("dockerfile", ""),
+            readme_ci_section=data.get("readme_ci_section", ""),
+            files=data.get("files", {}),
+            reasoning=data.get("reasoning", ""),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Static templates (always-valid fallbacks)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _github_actions_yml(project_title: str, python_files: List[str]) -> str:
+    files_str = " ".join(python_files) if python_files else "."
+    return f"""\
+name: CI — {project_title}
+
+on:
+  push:
+    branches: ["main", "master", "develop"]
+  pull_request:
+    branches: ["main", "master"]
+
+jobs:
+  lint:
+    name: Lint & Type-Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install lint dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy
+
+      - name: Run ruff (lint)
+        run: ruff check {files_str} --output-format=github
+
+      - name: Run mypy (type-check)
+        run: mypy {files_str} --ignore-missing-imports --no-strict-optional
+
+  test:
+    name: Pytest Suite
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{{{ matrix.python-version }}}}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{{{ matrix.python-version }}}}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run pytest with coverage
+        run: |
+          pytest -v --tb=short --cov=. --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
+"""
+
+
+def _requirements_txt(code_files: Dict[str, str]) -> str:
+    """Infer third-party imports from generated code."""
+    stdlib = {
+        "os", "sys", "re", "json", "math", "time", "datetime", "typing",
+        "dataclasses", "enum", "uuid", "abc", "functools", "itertools",
+        "collections", "io", "pathlib", "shutil", "tempfile", "subprocess",
+        "threading", "queue", "copy", "hashlib", "hmac", "base64", "struct",
+        "socket", "http", "urllib", "email", "logging", "warnings", "inspect",
+        "ast", "dis", "gc", "traceback", "contextlib", "weakref", "operator",
+        "heapq", "bisect", "array", "string", "textwrap", "difflib",
+        "fnmatch", "glob", "stat", "errno", "signal", "pickle", "shelve",
+        "sqlite3", "csv", "configparser", "argparse", "getopt",
+    }
+    found: set = set()
+    import_re = re.compile(
+        r"^(?:import\s+([\w.]+)|from\s+([\w.]+)\s+import)", re.MULTILINE
+    )
+    for code in code_files.values():
+        for m in import_re.finditer(code):
+            mod = (m.group(1) or m.group(2) or "").split(".")[0]
+            if mod and mod not in stdlib and not mod.startswith("_"):
+                found.add(mod)
+
+    lines = ["# Auto-generated by DevOps Agent", "pytest>=8.0", "pytest-cov>=5.0"]
+    known_packages = {
+        "fastapi": "fastapi>=0.110",
+        "uvicorn": "uvicorn>=0.29",
+        "pydantic": "pydantic>=2.0",
+        "sqlalchemy": "SQLAlchemy>=2.0",
+        "requests": "requests>=2.31",
+        "httpx": "httpx>=0.27",
+        "redis": "redis>=5.0",
+        "boto3": "boto3>=1.34",
+        "click": "click>=8.1",
+        "typer": "typer>=0.12",
+        "rich": "rich>=13.0",
+        "loguru": "loguru>=0.7",
+        "yaml": "PyYAML>=6.0",
+        "toml": "tomllib",
+    }
+    for mod in sorted(found):
+        if mod in known_packages:
+            lines.append(known_packages[mod])
+    return "\n".join(lines) + "\n"
+
+
+def _pre_commit_config() -> str:
+    return """\
+# .pre-commit-config.yaml — generated by DevOps Agent
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.4
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.0
+    hooks:
+      - id: mypy
+        additional_dependencies: [types-requests]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+"""
+
+
+def _dockerfile(python_files: List[str]) -> str:
+    entry = "main.py" if "main.py" in python_files else (python_files[0] if python_files else "main.py")
+    return f"""\
+# Dockerfile — generated by DevOps Agent
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application source
+COPY . .
+
+# Run tests as part of build verification
+RUN pytest -v --tb=short
+
+CMD ["python", "{entry}"]
+"""
+
+
+def _readme_ci_section(project_title: str) -> str:
+    return f"""
+## CI/CD Pipeline
+
+This project ships with a complete GitHub Actions workflow.
+
+| Check | Tool | Trigger |
+|---|---|---|
+| Lint | `ruff` | Every push / PR |
+| Type-check | `mypy` | Every push / PR |
+| Tests | `pytest` + `pytest-cov` | Every push / PR (Python 3.10–3.12) |
+| Coverage | Codecov | Every push / PR |
+
+### Run locally
+
+```bash
+# Install dev tools
+pip install ruff mypy pytest pytest-cov
+
+# Lint
+ruff check .
+
+# Type-check
+mypy . --ignore-missing-imports
+
+# Tests with coverage
+pytest -v --cov=. --cov-report=term-missing
+```
+
+### Pre-commit hooks
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DevOpsAgent:
+    """
+    DevOps / CI Agent.
+    Generates GitHub Actions workflow, requirements.txt, pre-commit config,
+    and Dockerfile for the generated project.
+    Composable: toggled via feature_flags["cicd_scaffolding"].
+    """
+
+    SYSTEM_PROMPT = """You are a Senior DevOps & Platform Engineering Agent on an autonomous engineering team.
+Your task is to generate a complete, production-grade CI/CD scaffold for the supplied Python project.
+
+You MUST respond strictly in valid JSON matching this schema:
+{
+  "reasoning": "Detailed rationale for CI workflow design, tool choices, matrix strategy, and coverage reporting.",
+  "github_actions_workflow": "complete .github/workflows/ci.yml YAML content as a string",
+  "requirements_txt": "complete requirements.txt content as a string",
+  "pre_commit_config": "complete .pre-commit-config.yaml content as a string",
+  "dockerfile": "complete Dockerfile content as a string",
+  "readme_ci_section": "markdown CI/CD section to append to README.md"
+}
+Do NOT include markdown fences or commentary outside the JSON.
+"""
+
+    def __init__(self, llm: BaseLLMProvider):
+        self.llm = llm
+
+    def run(
+        self,
+        requirements: RequirementsDocument,
+        architecture: ArchitectureDocument,
+        code_files: Dict[str, str],
+        test_result_summary: Optional[str] = None,
+    ) -> CICDPackage:
+        """
+        Generates full CI/CD scaffold.
+        Tries LLM first; falls back to deterministic templates on any failure.
+        """
+        python_files = [k for k in code_files if k.endswith(".py")]
+        project_title = requirements.title or "Generated Project"
+
+        # Try LLM
+        llm_data = self._call_llm(requirements, architecture, python_files, test_result_summary)
+
+        # Build final package — LLM values OR static fallbacks
+        gha = llm_data.get("github_actions_workflow") or _github_actions_yml(project_title, python_files)
+        req = llm_data.get("requirements_txt")        or _requirements_txt(code_files)
+        pre = llm_data.get("pre_commit_config")       or _pre_commit_config()
+        dkr = llm_data.get("dockerfile")              or _dockerfile(python_files)
+        rme = llm_data.get("readme_ci_section")       or _readme_ci_section(project_title)
+        rsn = llm_data.get("reasoning", "Generated deterministic CI/CD scaffold based on detected imports and project structure.")
+
+        files: Dict[str, str] = {
+            ".github/workflows/ci.yml": gha,
+            "requirements.txt":         req,
+            ".pre-commit-config.yaml":  pre,
+            "Dockerfile":               dkr,
+        }
+
+        return CICDPackage(
+            github_actions_workflow=gha,
+            requirements_txt=req,
+            pre_commit_config=pre,
+            dockerfile=dkr,
+            readme_ci_section=rme,
+            files=files,
+            reasoning=rsn,
+        )
+
+    # ── private ──────────────────────────────────────────────────────────────
+
+    def _call_llm(
+        self,
+        requirements: RequirementsDocument,
+        architecture: ArchitectureDocument,
+        python_files: List[str],
+        test_result_summary: Optional[str],
+    ) -> Dict[str, Any]:
+        payload = {
+            "project_title": requirements.title,
+            "python_files": python_files,
+            "architecture_summary": architecture.system_overview[:500],
+            "test_result_summary": test_result_summary or "Tests passed.",
+        }
+        try:
+            raw = self.llm.generate(
+                system_prompt=self.SYSTEM_PROMPT,
+                user_prompt=f"Project context:\n{json.dumps(payload, indent=2)}",
+                temperature=0.2,
+                json_output=True,
+            )
+            return self._parse_json(raw)
+        except Exception:
+            return {}
+
+    def _parse_json(self, raw: str) -> Dict[str, Any]:
+        cleaned = raw.strip()
+        cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r"```$",          "", cleaned, flags=re.MULTILINE).strip()
+        try:
+            return json.loads(cleaned)
+        except Exception:
+            m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+            if m:
+                try: return json.loads(m.group(0))
+                except Exception: pass
+        return {}

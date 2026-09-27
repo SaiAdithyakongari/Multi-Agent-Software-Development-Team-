@@ -1,0 +1,6 @@
+{
+  "name": "Multi-Agent Software Development Team",
+  "description": "An industrial-quality multi-agent software engineering automation platform orchestrating requirements, architecture, code generation, code review, test generation and execution sandbox, bug-fix loop, and documentation with Git version control.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
